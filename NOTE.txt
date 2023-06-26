@@ -1,0 +1,1 @@
+1. must use CUDA_VISIBLE_DEVICES to restrict the gpu number to 1. otherwise, the batch size will be wrong.

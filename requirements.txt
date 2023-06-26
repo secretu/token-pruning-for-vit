@@ -1,0 +1,8 @@
+transformers==4.15.0
+scipy==1.7.3
+datasets
+scikit-learn==1.0.2
+torch==1.12.1
+black
+wandb
+pytorchltr
