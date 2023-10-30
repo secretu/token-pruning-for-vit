@@ -1,8 +1,9 @@
+import torch
 from models.l0_module import L0ModuleForMAC,L0Module
 from pathlib import Path
 from datasets import load_dataset, load_metric, DatasetDict
-import torch
-from trainer.trainer import CoFiTrainer 
+from trainer.trainer_distilation import CoFiTrainer 
+# from trainer.trainer import CoFiTrainer
 import transformers
 import torch.backends.cudnn as cudnn
 import os
@@ -17,7 +18,9 @@ from transformers import (HfArgumentParser, TrainingArguments, PretrainedConfig,
 from sklearn.metrics import accuracy_score,top_k_accuracy_score
 from dataset_util import build_dataset, build_transform
 from transformers.models.deit.modeling_deit import DeiTConfig
-from models.model_deit import PrunDeiTModelForClassficationWithTeacher,PrunDeiTModelForClassfication
+# from models.model_deit_vit import PrunDeiTModelForClassficationWithTeacher
+from models.model_deit_vit_newscore import PrunDeiTModelForClassficationWithTeacher
+
 from transformers import AutoConfig, AutoTokenizer, EvalPrediction, default_data_collator, DataCollatorWithPadding
 from args import AdditionalArguments, DataTrainingArguments
 from models.model_args import ModelArguments
@@ -28,7 +31,6 @@ logger = logging.getLogger(__name__)
 import warnings
 warnings.filterwarnings("ignore")
 
-
 def main():    
     parser = HfArgumentParser(
         (ModelArguments, DataTrainingArguments, TrainingArguments, AdditionalArguments))
@@ -38,34 +40,43 @@ def main():
     # train_dataset,nb_classes = build_dataset(is_train=True, args=data_args,pre_transform=True)
     # eval_dataset, _ = build_dataset(is_train=False, args=data_args,pre_transform=True)
     train_dataset,nb_classes = build_dataset(is_train=True, args=data_args,pre_transform=False)
-    data_args.data_path = '/data/imaginenet/ILSVRC2012_data_set_transformed'  #eval dataset transformed
-    eval_dataset, _ = build_dataset(is_train=False, args=data_args,pre_transform=True)
+    # data_args.data_path = '/data/imaginenet/ILSVRC2012_data_set_transformed'  #eval dataset transformed
+    eval_dataset, _ = build_dataset(is_train=False, args=data_args,pre_transform=False)
     
     # disable layer gate 
-    # additional_args.disable_layer_gate = True
-    # additional_args.select_token_pruning_layer = [0,1,2,3,4,5,6,7,8,9]
+    additional_args.disable_layer_gate = True
+    # additional_args.select_token_pruning_layer = [0,2,4,6,7]
+    additional_args.select_token_pruning_layer = [1,4,7]
+    # additional_args.select_token_pruning_layer = [0,1,2,3,4,5,6,7,8,9]    
     ################################################
-    training_args.eval_steps = 1000
-    training_args.logging_steps = 100
+    additional_args.pruning_type = 'token+structured_mlp+structured_heads+pruner'    #actually not
+    # additional_args.pruning_type = 'structured_mlp+structured_heads'
+    training_args.eval_steps = 10000
+    training_args.logging_steps = 1000
     training_args.num_train_epochs = 30
-    training_args.per_device_train_batch_size = 32
-    training_args.per_device_eval_batch_size = 32
+    training_args.per_device_train_batch_size = 64
+    training_args.per_device_eval_batch_size = 64
     training_args.do_train = True
     training_args.do_eval = True
     training_args._n_gpu = 1
-    training_args.learning_rate=1.5e-5       # classification lr
-    additional_args.reg_learning_rate = 1e-4   # loga lr
-    additional_args.lambda_learning_rate = 1e-4    # lambda lr
-    additional_args.target_sparsity = 0.5
+    training_args.learning_rate= 5e-6    # classification lr
+    additional_args.reg_learning_rate = 1e-3  # loga lr
+    additional_args.lambda_learning_rate = 1e-3    # lambda lr
+    additional_args.target_sparsity = 0.3695
     additional_args.start_sparsity = 0
-    additional_args.lagrangian_warmup_epochs = 4
+    additional_args.lagrangian_warmup_epochs = 6 #6
     additional_args.sparsity_epsilon = 0.001
     training_args.label_smoothing_factor = 0.1  #0.001 
-    training_args.dataloader_num_workers = 10
+    training_args.dataloader_num_workers = 10   
+    additional_args.bin_num = 196
+    additional_args.topk = 100
+    additional_args.scheduler_type = "cosin"
+    cls_kl_ratio = 0.5
+    token_kl_ratio = 0.5
     
     if training_args.output_dir == None:
-        training_args.output_dir= '/home/chengquan/ToP-prune_before_FFN/train_out_put_dir/new_revisied/run_test_2'
-    
+        training_args.output_dir= '/home/chengquan/token_model/train_out_put_dir/run_9'  
+        
     os.makedirs(training_args.output_dir, exist_ok=True)
     
     training_args.logging_dir = os.path.join(training_args.output_dir,'logdir')
@@ -107,10 +118,6 @@ def main():
 
     set_seed(training_args.seed)
 
-    # print all arguments
-    # log_all_parameters(logger, model_args, data_args,
-    #                    training_args, additional_args)
-    
     config = AutoConfig.from_pretrained(
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
         num_labels=nb_classes,
@@ -122,15 +129,12 @@ def main():
  
     # model
     model = PrunDeiTModelForClassficationWithTeacher(config=config,token_prune_loc=additional_args.prune_location)
-    teacher_model = DeiTForImageClassificationWithTeacher(config=config)
-    weight_path = '/home/chengquan/ToP-prune_before_FFN/pretrained_model/deit-small-distilled-patch16-224'
+    teacher_model = PrunDeiTModelForClassficationWithTeacher(config=config)
+    weight_path = '/home/chengquan/ToP-prune_before_FFN/pretrained_model/deit_small_patch16_224.pth'
     model.load_state_dict(torch.load(weight_path))
-    # model = PrunDeiTModelForClassfication(config=config,token_prune_loc=additional_args.prune_location)
-    # weight_path = '/home/chengquan/ToP-prune_before_FFN/pretrained_model/deit_small_patch16_224-cd65a155.pth'
-    # model.load_state_dict(torch.load(weight_path))
-    # quit()
+ 
     
-    
+
     teacher_model.load_state_dict(torch.load(weight_path))
     teacher_model.eval()
     # quit()
@@ -189,31 +193,13 @@ def main():
         target = torch.from_numpy(labels)
         acc1, acc5 = accuracy(pred, target, topk=(1, 5))
         return {"top1ACC": acc1, "top5ACC": acc5}
-        # return {"top1ACC": acc1}
-        
-    # def collate_fn(examples):
-    #     x = []
-    #     y = []
-    #     for item in examples:
-    #         x.append(item[0])
-    #         y.append(torch.tensor([item[1]]))
-    #     pixel_values = torch.stack([i for i in x])
-    #     labels = torch.stack([i for i in y])
-    #     B, C, HW, HW = pixel_values.size()
-    #     num_tokens = 196 + 2 # for 14 * 14
-    #     attention_mask = torch.ones(B,num_tokens).to(torch.float64)
-        
-    #     return {
-    #         'pixel_values': pixel_values,
-    #         'labels': labels,
-    #         'attention_mask':attention_mask
-    #     }
+
     
     def collate_fn(examples):
         pixel_values, labels = zip(*examples)
         pixel_values = torch.stack(pixel_values)
         labels = torch.stack([torch.tensor([label]) for label in labels])
-        attention_mask = torch.ones(pixel_values.size(0), 196 + 2).to(torch.float64)
+        attention_mask = torch.ones(pixel_values.size(0), 196 + 1).to(torch.float64)
         return {
             'pixel_values': pixel_values,
             'labels': labels,
@@ -221,7 +207,22 @@ def main():
         }
     
     feature_extractor = DeiTFeatureExtractor.from_pretrained(model_args.model_name_or_path)
-
+    
+    from timm.data import Mixup
+    mixup = 0.8
+    cutmix = 1.0
+    cutmix_minmax = None
+    mixup_prob = 1.0
+    mixup_switch_prob = 0.5
+    mixup_mode = 'batch'
+    smoothing = 0.1
+    nb_classes = 1000
+    mixup_fn = Mixup(
+            mixup_alpha=mixup, cutmix_alpha=cutmix, cutmix_minmax=cutmix_minmax,
+            prob=mixup_prob, switch_prob=mixup_switch_prob, mode=mixup_mode,
+            label_smoothing= smoothing, num_classes= nb_classes)
+    
+    
     
     trainer = CoFiTrainer(
         model=model,
@@ -234,6 +235,9 @@ def main():
         data_collator=collate_fn,
         l0_module=l0_module,
         teacher_model=teacher_model,
+        mixup_fn = mixup_fn,
+        cls_kl_ratio = cls_kl_ratio,
+        token_kl_ratio = token_kl_ratio
     )
     from transformers.integrations import AzureMLCallback, ProgressCallback
     trainer.remove_callback(AzureMLCallback)
@@ -250,13 +254,6 @@ def main():
         trainer.train()
         trainer.save_model()
         # tokenizer.save_pretrained(training_args.output_dir)
-
-
-
-
-
-
-
 
 
 if __name__ == '__main__':

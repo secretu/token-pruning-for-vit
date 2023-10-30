@@ -28,7 +28,8 @@ AVERAGE_SAMPLE_LENGTH = {
     "20news": 551,
     "imdb": 264,
     "squad_v2": 152,
-    None: 152,
+    # None: 152,
+    None: 196,
     "yelp": 179,
 }
 
@@ -45,7 +46,8 @@ MAX_SEQUENCE_LENGTH = {
     "20news": 512,
     "imdb": 512,
     "squad_v2": 384,
-    None: 384,
+    # None: 384,
+    None: 196,
     "yelp": 512,
 }
 
@@ -170,8 +172,7 @@ class L0Module(Module):
     def initialize_parameters(self, size, num_layer=None):
         if num_layer is not None:
             return Parameter(torch.Tensor(num_layer, size))
-        else:
-            return Parameter(torch.Tensor(size))
+        else:            return Parameter(torch.Tensor(size))
 
     def initialize_hidden(self):
         self.hidden_loga = self.initialize_parameters(self.hidden_size)
@@ -183,7 +184,8 @@ class L0Module(Module):
 
     def initialize_structured_head(self, add_prunable_model_size=True):
         self.head_loga = self.initialize_parameters(self.num_attention_heads, self.num_hidden_layers)
-        self.reset_loga(self.head_loga, mean=10)
+        # self.reset_loga(self.head_loga, mean=10)
+        self.reset_loga(self.head_loga, mean=4)
         self.add_one_module(self.head_loga, type="head", 
                             parameter_per_dim=self.params_per_head, size=self.num_attention_heads,
                             shape=[self.num_hidden_layers, 1, self.num_attention_heads, 1, 1])
@@ -207,7 +209,7 @@ class L0Module(Module):
                             parameter_per_dim=self.params_per_intermediate_dim, size=self.intermediate_size,
                             shape=[self.num_hidden_layers, 1, 1, self.intermediate_size])
         self.prunable_model_size += self.params_per_mlp_layer * self.num_hidden_layers
-        self.reset_loga(self.int_loga)
+        self.reset_loga(self.int_loga,mean=4)
         logger.info(f"Initialized structured mlp! Prunable_model_size = {self.prunable_model_size}")
 
     def initialize_whole_mlp(self):
@@ -222,19 +224,27 @@ class L0Module(Module):
     def initialize_token(self):
         rank_bin_num = self.bin_num
         self.token_loga = self.initialize_parameters(rank_bin_num, len(self.token_prune_loc))
+        # self.token_loga = Parameter(torch.Tensor(len(self.token_prune_loc), rank_bin_num),requires_grad=False)
+        
+    
         self.add_one_module(self.token_loga, type="token",
                             parameter_per_dim=None, size=rank_bin_num,
                             shape=[len(self.token_prune_loc), rank_bin_num])
         self.reset_loga(self.token_loga, mean=10)
+        # self.reset_loga(self.token_loga, mean=1.5)
         logger.info(f"Initialized token!")
     
     def initialize_pruner(self):
         n_layer = len(self.token_prune_loc) + 1
         self.pruner_loga = self.initialize_parameters(n_layer - 1)
+        # self.pruner_loga = Parameter(torch.Tensor(n_layer - 1),requires_grad=False)
+        
+        
         self.add_one_module(self.pruner_loga, type="pruner",
                             parameter_per_dim=None, size=1,
                             shape=[n_layer - 1])
-        self.reset_loga(self.pruner_loga, mean=-10)
+        # self.reset_loga(self.pruner_loga, mean=-10)
+        self.reset_loga(self.pruner_loga, mean=10)
         logger.info(f"Initialized pruner!")
         
     def reset_loga(self, tensor, mean=None, droprate_init=None):
@@ -357,6 +367,7 @@ class L0Module(Module):
                 self.lambda_1 * (expected_sparsity - target_sparsity)
                 + self.lambda_2 * (expected_sparsity - target_sparsity) ** 2 #! where is the lambda 1 and lambda 2 from
         )
+        # lagrangian_loss = 10000* lagrangian_loss
         return lagrangian_loss, expected_sparsity, target_sparsity
 
     def get_eps(self, size):
@@ -442,11 +453,14 @@ class L0Module(Module):
                     zs[type] = torch.stack(zs[type])
         # disable layer gate
         # self.disable_layer_gate = True
+
         if self.disable_layer_gate:
             zs['pruner_z'] = torch.ones_like(zs['pruner_z'])
         if self.select_token_pruning_layer is not None:
             not_selected_layer = [i for i in range(len(zs['token_z'])) if i not in self.select_token_pruning_layer]
-            zs['token_z'][not_selected_layer] = 1.0
+            # zs['token_z'][not_selected_layer] = 1.0
+            zs['pruner_z'] = torch.ones_like(zs['pruner_z'])
+            zs['pruner_z'][not_selected_layer] = 0.0
         return zs
 
 
@@ -490,8 +504,9 @@ class L0ModuleForMAC(L0Module):
         qkv_mac = 3 * seq_len * hidden_size * hidden_size_per_head
         qk_mac = seq_len * hidden_size_per_head * seq_len
         softmax_mac = seq_len * seq_len
-        v_mac = seq_len * hidden_size_per_head * seq_len
-        return qkv_mac + qk_mac + softmax_mac + v_mac
+        v_mac = seq_len * hidden_size_per_head * seq_len   #different
+        attn_out_mac = seq_len * hidden_size * hidden_size_per_head
+        return qkv_mac + qk_mac + softmax_mac + v_mac + attn_out_mac
     
     def calculate_mac_for_one_mha(self, seq_len, hidden_size, num_attention_heads, hidden_size_per_head):
         mac = num_attention_heads * self.calculate_mac_for_one_attention_head(seq_len, hidden_size, hidden_size_per_head)
@@ -500,7 +515,7 @@ class L0ModuleForMAC(L0Module):
         return mac
     
     def calculate_mac_for_one_ffn(self, seq_len, hidden_size, intermediate_size):
-        # dense mac
+        # dense mac+
         mac = seq_len * hidden_size * intermediate_size
         # dense mac
         mac += seq_len * intermediate_size * hidden_size
@@ -513,7 +528,7 @@ class L0ModuleForMAC(L0Module):
     ):
         mac = 0
         mac += self.calculate_mac_for_one_mha(
-            att_seq_len, hidden_size, num_attention_heads[0], hidden_size_per_head,
+            att_seq_len, hidden_size, num_attention_heads, hidden_size_per_head,
         )
         mac += self.calculate_mac_for_one_ffn(
             ffn_seq_len, hidden_size, intermediate_size,
@@ -529,7 +544,8 @@ class L0ModuleForMAC(L0Module):
         for i in range(num_hidden_layers):
             mac += self.calculate_mac_for_one_layer(
                 att_seq_len=token_length_for_each_layer[i],
-                ffn_seq_len=token_length_for_each_layer[min(i+1, num_hidden_layers-1)],
+                # ffn_seq_len=token_length_for_each_layer[min(i+1, num_hidden_layers-1)],
+                ffn_seq_len = token_length_for_each_layer[i],
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size_list[i],
                 num_attention_heads=num_attention_heads_list[i],
@@ -539,20 +555,21 @@ class L0ModuleForMAC(L0Module):
     
     def calculate_mac_for_model(
         self,
-        token_length_for_each_layer = [128] * 12,
-        hidden_size = 768,
-        intermediate_size_list = [3072] * 12,
-        num_attention_heads_list = [[12]] * 12,
+        token_length_for_each_layer = [197] * 12,
+        hidden_size = 384,
+        intermediate_size_list = [1536] * 12,
+        num_attention_heads_list = [6] * 12,
         hidden_size_per_head = 64,
         num_hidden_layers = 12,
         num_labels = 2,
         vocab_size = 30522,
     ):
-        intermediate_size_list = intermediate_size_list[:num_hidden_layers]
-        num_attention_heads_list = num_attention_heads_list[:num_hidden_layers]
+
         assert len(token_length_for_each_layer) == num_hidden_layers
         assert len(intermediate_size_list) == num_hidden_layers
         assert len(num_attention_heads_list) == num_hidden_layers
+        # mac += self.num_patches * self.embed_dim * 3 * patch_size * patch_size
+        
         mac = self.calculate_mac_for_encoder(
             token_length_for_each_layer=token_length_for_each_layer,
             hidden_size=hidden_size,
@@ -561,6 +578,7 @@ class L0ModuleForMAC(L0Module):
             num_hidden_layers=num_hidden_layers,
             hidden_size_per_head=hidden_size_per_head,
         )
+        mac += 14 * 14 *  hidden_size * 3 * 16 * 16  # embedding
         return mac
     
     def calculate_mac_for_one_layer_vectorized(
@@ -583,42 +601,46 @@ class L0ModuleForMAC(L0Module):
         return mac
     
     def calculate_mac_for_encoder_vectorized(
-        self, token_length_for_each_layer: torch.tensor,
-        hidden_size: int = 768,
-        intermediate_size: int = 3072,
-        num_attention_heads: int = 12,
-        hidden_size_per_head: int = 64,
-        num_hidden_layers: int = 12,
+        self, token_length_for_each_layer,
+        hidden_size,
+        intermediate_size,
+        num_attention_heads,
+        hidden_size_per_head,
+        num_hidden_layers,
     ):
-        mac = self.calculate_mac_for_one_layer_vectorized(
-            att_seq_len=token_length_for_each_layer,
-            ffn_seq_len=torch.hstack([token_length_for_each_layer[..., 1:], token_length_for_each_layer[..., -1:]]),
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_attention_heads=num_attention_heads,
-            hidden_size_per_head=hidden_size_per_head,
-        ).sum(-1)
+        mac = 0
+        for i in range(num_hidden_layers):
+            mac += self.calculate_mac_for_one_layer_vectorized(
+                att_seq_len=token_length_for_each_layer[i],
+                # ffn_seq_len=torch.hstack([token_length_for_each_layer[..., 1:], token_length_for_each_layer[..., -1:]]),
+                # ffn_seq_len=token_length_for_each_layer[min(i+1, num_hidden_layers-1)],
+                ffn_seq_len = token_length_for_each_layer[i],
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size[i],
+                num_attention_heads=num_attention_heads[i],
+                hidden_size_per_head=hidden_size_per_head,
+            ).sum(-1)
         return mac
-    
+       
     def calculate_mac_for_model_vectorized(
-        self, token_length_for_each_layer: torch.tensor,
-        hidden_size: int = 768,
-        intermediate_size: int = 3072,
-        num_attention_heads: int = 12,
-        hidden_size_per_head: int = 64,
-        num_hidden_layers: int = 12,
-        num_labels: int = 2,
-        vocab_size: int = 30522,
+        self, token_length_for_each_layer,
+        hidden_size,
+        hidden_size_per_head,
+        num_hidden_layers,
+        intermediate_size,
+        num_attention_heads,
     ):
         assert len(token_length_for_each_layer.shape) == 2 and token_length_for_each_layer.shape[1] == num_hidden_layers
+    
         mac = self.calculate_mac_for_encoder_vectorized(
-            token_length_for_each_layer=token_length_for_each_layer,
+            token_length_for_each_layer=token_length_for_each_layer[0],
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_attention_heads=num_attention_heads,
             hidden_size_per_head=hidden_size_per_head,
             num_hidden_layers=num_hidden_layers,
         )
+        mac += 14 * 14 *  hidden_size * 3 * 16 * 16  # embeddings  
         return mac
 
     def get_mac_and_constraint(
@@ -632,13 +654,20 @@ class L0ModuleForMAC(L0Module):
         assert manually_add_CLS_token
         assert not disable_token_pruning
         # assert self.num_hidden_layers == 12
-        assert len(self.types) == 2 and self.types[0] == "token" and self.types[1] == "pruner"
+        # assert len(self.types) == 2 and self.types[0] == "token" and self.types[1] == "pruner"
 
         if "token" in self.types:
             if token_score is None:
                 token_score = 1 - self.cdf_qz(0, self.token_loga)  # 12 * 128
             if pruner_score is None:
-                pruner_score = 1 - self.cdf_qz(0, self.pruner_loga)  # 11
+            #     pruner_score = 1 - self.cdf_qz(0, self.pruner_loga)  # 11
+                if self.select_token_pruning_layer is not None:
+                    # force the pruner score to adapt to self.select_token_pruning_layer
+                    pruner_score = torch.zeros_like(self.pruner_loga)
+                    for idx in self.select_token_pruning_layer:
+                        pruner_score[idx] = 1.0
+                else:
+                    pruner_score = 1 - self.cdf_qz(0, self.pruner_loga)  # 11
             token_length_for_each_layer = torch.mean(token_score, dim=1)
 
             # add this line.
@@ -658,7 +687,6 @@ class L0ModuleForMAC(L0Module):
                 else:
                     token_length_for_each_layer_list.append(token_length_for_each_layer_list[-1])
             assert p_count == len(self.token_prune_loc)
-            # attention_mask = torch.ones_like(token_score+2,device=token_length_for_each_layer.device)
             full_lengths = attention_mask.sum(-1).float()
             full_lengths_include_padding = torch.ones_like(full_lengths, device=full_lengths.device) * attention_mask.shape[-1]
 
@@ -683,27 +711,44 @@ class L0ModuleForMAC(L0Module):
             full_lengths_include_padding = full_lengths_include_padding.unsqueeze(-1).repeat(1, self.num_hidden_layers)
             token_length_for_each_layer_list = torch.stack(token_length_for_each_layer_list).unsqueeze(0).repeat(B, 1)
             pruned_lengths = (full_lengths - 1) * token_length_for_each_layer_list + 1
+
+
+            head_score = 1 - self.cdf_qz(0, self.head_loga) # 12 * 6
+            remained_head = torch.sum(head_score, dim=1, keepdim=True).squeeze() 
+            
+            int_socre = 1 - self.cdf_qz(0, self.int_loga)
+            remained_intermediate_size = torch.sum(int_socre, dim=1, keepdim=True).squeeze()
+
             macs = self.calculate_mac_for_model_vectorized(
                 token_length_for_each_layer=pruned_lengths,
-                num_labels=self.num_labels,
+                # num_labels=self.num_labels,
                 num_hidden_layers=self.num_hidden_layers,
+                hidden_size = self.config.hidden_size,
+                num_attention_heads = remained_head,
+                hidden_size_per_head=self.config.hidden_size/self.config.num_attention_heads,
+                intermediate_size=remained_intermediate_size,
             )
             full_macs = self.calculate_mac_for_model_vectorized(
                 token_length_for_each_layer=full_lengths if not self.include_padding else full_lengths_include_padding,
-                num_labels=self.num_labels,
+                # num_labels=self.num_labels,
                 num_hidden_layers=self.num_hidden_layers,
+                hidden_size = self.config.hidden_size,
+                num_attention_heads = [self.config.num_attention_heads] * self.num_hidden_layers,
+                hidden_size_per_head=self.config.hidden_size/self.config.num_attention_heads,
+                intermediate_size=[self.config.intermediate_size] * self.num_hidden_layers,
             )
             relative_macs = (macs / full_macs).mean()
 
             task = self.config.finetuning_task
-            if task is None:
-                task = 'squad_v2'
+            # if task is None:
+            #     task = 'squad_v2'
             max_sequence_lengths = torch.ones_like(full_lengths) * MAX_SEQUENCE_LENGTH[task]
-            sequence_full_macs = self.calculate_mac_for_model_vectorized(
-                token_length_for_each_layer=max_sequence_lengths,
-                num_labels=self.num_labels,
-                num_hidden_layers=self.num_hidden_layers,
-            )
+            sequence_full_macs = full_macs
+            # sequence_full_macs = self.calculate_mac_for_model_vectorized(
+            #     token_length_for_each_layer=max_sequence_lengths,
+            #     num_labels=self.num_labels,
+            #     num_hidden_layers=self.num_hidden_layers,
+            # )
             relative_sequence_macs = (macs / sequence_full_macs).mean()
             return relative_macs, relative_sequence_macs
         else:
@@ -726,7 +771,6 @@ class L0ModuleForMAC(L0Module):
             token_score=token_score,
             pruner_score=pruner_score,
         )
-
         expected_sparsity = 1 - expected_relative_mac
         expected_sequence_sparsity = 1 - expected_sequence_relative_mac
         if self.lagrangian_warmup > 0:
@@ -735,7 +779,9 @@ class L0ModuleForMAC(L0Module):
                 self.lambda_1 * (expected_sparsity - target_sparsity)
                 + self.lambda_2 * (expected_sparsity - target_sparsity) ** 2 #! where is the lambda 1 and lambda 2 from
         )
-        
+        # if expected_sparsity > 0.03:
+        #     print(f'expected_sparsity{expected_sparsity}')
+
         return lagrangian_loss, expected_sparsity, target_sparsity, expected_sequence_sparsity
     
     def mask_regularization(self, pruned_steps):
@@ -763,6 +809,9 @@ class L0ModuleForMAC(L0Module):
         numpified_zs = self.get_z_from_zs(zs)
         token_z = numpified_zs["token"].astype(bool)
         pruner_z = numpified_zs["pruner"].astype(bool)
+        int_z = numpified_zs["intermediate"].astype(bool)
+        head_z = numpified_zs["head"].astype(bool)
+
         assert token_z.shape[0] == len(self.token_prune_loc) and len(token_z.shape) == 2
         rank_bin_num = token_z.shape[1]
 
@@ -772,22 +821,68 @@ class L0ModuleForMAC(L0Module):
             if pruner_z[i]:
                 remaining_token_ratio[loc] = temp[i]
         remaining_token_ratio = np.round(np.cumprod(remaining_token_ratio), 2).tolist()
-
         if self.include_padding:
             standard_seq_length = MAX_SEQUENCE_LENGTH[task_name]
         else:
             standard_seq_length = AVERAGE_SAMPLE_LENGTH[task_name]
         remaining_token_nums = [int((AVERAGE_SAMPLE_LENGTH[task_name] - 1) * r) + 1 for r in remaining_token_ratio]
+        print(head_z.shape)
+        print(int_z.shape)
+        remained_head = np.sum(head_z, axis=1, keepdims=True).ravel()
+        remained_intermediate_size = np.sum(int_z, axis=1, keepdims=True).ravel()
+        # print(remained_head.shape)
+
         remaining_macs = self.calculate_mac_for_model(
             token_length_for_each_layer=remaining_token_nums,
             num_labels=self.num_labels,
             num_hidden_layers=self.num_hidden_layers,
+            hidden_size = self.config.hidden_size,
+            num_attention_heads_list = remained_head,
+            hidden_size_per_head=self.config.hidden_size/self.config.num_attention_heads,
+            intermediate_size_list=remained_intermediate_size,
+            
         )
         full_macs = self.calculate_mac_for_model(
             token_length_for_each_layer=[standard_seq_length] * self.num_hidden_layers,
             num_labels=self.num_labels,
             num_hidden_layers=self.num_hidden_layers,
+            hidden_size = self.config.hidden_size,
+            num_attention_heads_list = [self.config.num_attention_heads] * self.num_hidden_layers,
+            hidden_size_per_head=self.config.hidden_size/self.config.num_attention_heads,
+            intermediate_size_list=[self.config.intermediate_size] * self.num_hidden_layers,
         )
+
+        model_spars_mac = self.calculate_mac_for_model(
+            token_length_for_each_layer=[standard_seq_length] * self.num_hidden_layers,
+            num_labels=self.num_labels,
+            num_hidden_layers=self.num_hidden_layers,
+            hidden_size = self.config.hidden_size,
+            num_attention_heads_list = remained_head,
+            hidden_size_per_head=self.config.hidden_size/self.config.num_attention_heads,
+            intermediate_size_list=remained_intermediate_size,
+        )
+
+        token_sparsity_mac = self.calculate_mac_for_model(
+            token_length_for_each_layer=remaining_token_nums,
+            num_labels=self.num_labels,
+            num_hidden_layers=self.num_hidden_layers,
+            hidden_size = self.config.hidden_size,
+            num_attention_heads_list = [self.config.num_attention_heads] * self.num_hidden_layers,
+            hidden_size_per_head=self.config.hidden_size/self.config.num_attention_heads,
+            intermediate_size_list=[self.config.intermediate_size] * self.num_hidden_layers,
+        )
+
+        token_ratio = 1 - token_sparsity_mac / full_macs
+        model_ratio = 1 - model_spars_mac / full_macs
+        total_ratio = 1 - remaining_macs / full_macs
+
+        if isinstance(model_ratio, list) and len(model_ratio) > 0:
+            model_ratio = model_ratio[0]
+        if isinstance(total_ratio, list) and len(total_ratio) > 0:
+            total_ratio = total_ratio[0]
+
+
+
 
         token_score = 1 - self.cdf_qz(0, self.token_loga)  # 12 * 128
         pruner_score = 1 - self.cdf_qz(0, self.pruner_loga)  # 12
@@ -805,13 +900,26 @@ class L0ModuleForMAC(L0Module):
         results["token_prune_loc"] = pruner_z.tolist()
         results["remaining_macs"] = remaining_macs
         results["remaining_token_ratio"] = remaining_token_ratio
-        results["macs_sparsity"] = round(1 - remaining_macs / full_macs, 4)
+        results["macs_sparsity"] = np.round(1 - remaining_macs / full_macs, 4)
+        results['token_ratio'] = np.round(token_ratio,4)
+        results['model_ratio'] = np.round(model_ratio,4)
+        results['total_ratio'] = np.round(total_ratio,4)
         results["lambda_1"] = self.lambda_1.item()
         results["lambda_2"] = self.lambda_2.item()
         results["lambda_3"] = self.lambda_3.item()
         return results
 
 if __name__ == "__main__":
+
+    result_dir = '/home/chengquan/ToP-prune_before_FFN/train_out_put_dir/attention_prob_as_score/run_1'
+    # import os
+    # config_f = os.path.join(result_dir,'config.json')
+    # from transformers import DeiTConfig
+    # config = DeiTConfig.from_json_file(config_f)
+    l0_weight_path = os.path.join(result_dir,'l0_module.pt') 
+    l0_module = torch.load(l0_weight_path)
+
+
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained("bert-base-uncased")
     # l0_module = L0Module(config, lagrangian_warmup=200, target_sparsity=0.5)

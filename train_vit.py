@@ -1,24 +1,18 @@
 from models.l0_module import L0ModuleForMAC,L0Module
-from pathlib import Path
-from datasets import load_dataset, load_metric, DatasetDict
 import torch
-from trainer.trainer import CoFiTrainer 
+from trainer.trainer_vit import CoFiTrainer
+# from trainer.trainer import CoFiTrainer
 import transformers
-import torch.backends.cudnn as cudnn
 import os
 from copy import deepcopy
-import numpy as np
 import sys
 from utils.utils import *
 from transformers import DeiTFeatureExtractor
-from transformers.models.deit.modeling_deit import DeiTForImageClassificationWithTeacher
-from transformers import (HfArgumentParser, TrainingArguments, PretrainedConfig,
-                          glue_output_modes, glue_tasks_num_labels, set_seed)
-from sklearn.metrics import accuracy_score,top_k_accuracy_score
-from dataset_util import build_dataset, build_transform
-from transformers.models.deit.modeling_deit import DeiTConfig
-from models.model_deit import PrunDeiTModelForClassficationWithTeacher,PrunDeiTModelForClassfication
-from transformers import AutoConfig, AutoTokenizer, EvalPrediction, default_data_collator, DataCollatorWithPadding
+from transformers.models.vit.modeling_vit import ViTForImageClassification
+from transformers import (HfArgumentParser, TrainingArguments,set_seed)
+from dataset_util import build_dataset
+from models.model_vit import PrunViTForImageClassification
+from transformers import AutoConfig
 from args import AdditionalArguments, DataTrainingArguments
 from models.model_args import ModelArguments
 from utils.cofi_utils import *
@@ -33,6 +27,7 @@ def main():
     parser = HfArgumentParser(
         (ModelArguments, DataTrainingArguments, TrainingArguments, AdditionalArguments))
     model_args, data_args, training_args, additional_args = parser.parse_args_into_dataclasses()
+    model_args.model_name_or_path = 'facebook/deit-small-patch16-224'
 
     # data_args.data_path = '/data/imaginenet/ILSVRC2012_data_set_transformed'
     # train_dataset,nb_classes = build_dataset(is_train=True, args=data_args,pre_transform=True)
@@ -45,7 +40,7 @@ def main():
     # additional_args.disable_layer_gate = True
     # additional_args.select_token_pruning_layer = [0,1,2,3,4,5,6,7,8,9]
     ################################################
-    training_args.eval_steps = 1000
+    training_args.eval_steps = 300
     training_args.logging_steps = 100
     training_args.num_train_epochs = 30
     training_args.per_device_train_batch_size = 32
@@ -54,17 +49,18 @@ def main():
     training_args.do_eval = True
     training_args._n_gpu = 1
     training_args.learning_rate=1.5e-5       # classification lr
-    additional_args.reg_learning_rate = 1e-4   # loga lr
-    additional_args.lambda_learning_rate = 1e-4    # lambda lr
+    additional_args.reg_learning_rate = 1e-2   # loga lr
+    additional_args.lambda_learning_rate = 1e-2     # lambda lr
     additional_args.target_sparsity = 0.5
-    additional_args.start_sparsity = 0
-    additional_args.lagrangian_warmup_epochs = 4
+    additional_args.start_sparsity = 0.1
+    additional_args.lagrangian_warmup_epochs = 1
     additional_args.sparsity_epsilon = 0.001
     training_args.label_smoothing_factor = 0.1  #0.001 
-    training_args.dataloader_num_workers = 10
+    training_args.dataloader_num_workers = 10   
+    additional_args.bin_num = 196
     
     if training_args.output_dir == None:
-        training_args.output_dir= '/home/chengquan/ToP-prune_before_FFN/train_out_put_dir/new_revisied/run_test_2'
+        training_args.output_dir= '/home/chengquan/ToP-prune_before_FFN/train_out_put_dir/new_revisied/run_test'
     
     os.makedirs(training_args.output_dir, exist_ok=True)
     
@@ -119,21 +115,16 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
- 
-    # model
-    model = PrunDeiTModelForClassficationWithTeacher(config=config,token_prune_loc=additional_args.prune_location)
-    teacher_model = DeiTForImageClassificationWithTeacher(config=config)
-    weight_path = '/home/chengquan/ToP-prune_before_FFN/pretrained_model/deit-small-distilled-patch16-224'
+  
+    # model  & teacher model
+    model = PrunViTForImageClassification(config=config,token_prune_loc=additional_args.prune_location)
+    teacher_model = PrunViTForImageClassification(config=config)
+    weight_path = '/home/chengquan/ToP-prune_before_FFN/pretrained_model/deit_small_patch16_224.pth'
     model.load_state_dict(torch.load(weight_path))
-    # model = PrunDeiTModelForClassfication(config=config,token_prune_loc=additional_args.prune_location)
-    # weight_path = '/home/chengquan/ToP-prune_before_FFN/pretrained_model/deit_small_patch16_224-cd65a155.pth'
-    # model.load_state_dict(torch.load(weight_path))
-    # quit()
-    
-    
+
     teacher_model.load_state_dict(torch.load(weight_path))
     teacher_model.eval()
-    # quit()
+
     # maybe need further change
     if additional_args.do_distill:
         teacher_model = model.from_pretrained(
@@ -213,7 +204,7 @@ def main():
         pixel_values, labels = zip(*examples)
         pixel_values = torch.stack(pixel_values)
         labels = torch.stack([torch.tensor([label]) for label in labels])
-        attention_mask = torch.ones(pixel_values.size(0), 196 + 2).to(torch.float64)
+        attention_mask = torch.ones(pixel_values.size(0), 196 + 1).to(torch.float64)
         return {
             'pixel_values': pixel_values,
             'labels': labels,
@@ -244,7 +235,7 @@ def main():
     print(training_args)
     print("Additional Arguments")
     print(additional_args)
-    # trainer.evaluate()
+    
     
     if training_args.do_train:
         trainer.train()

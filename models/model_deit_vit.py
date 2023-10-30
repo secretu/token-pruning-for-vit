@@ -12,6 +12,7 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 import os
 from transformers import AutoConfig
 from timm.loss import  SoftTargetCrossEntropy
+from transformers.models.vit.modeling_vit import ViTEmbeddings,ViTSelfOutput,ViTIntermediate,ViTOutput,ViTPooler,ViTPreTrainedModel
 
 
 class PrunDeiTLayerNorm(torch.nn.LayerNorm):
@@ -256,6 +257,7 @@ class PrunDeiTEncoder(DeiTEncoder):
             baseline_effective_lengths=[],
             pruned_effective_lengths=[],
         )
+        self.hidden_states = []
         for _ in range(config.num_hidden_layers):
             self.masks.append(None)
             self.pred_scores.append(None)
@@ -284,7 +286,6 @@ class PrunDeiTEncoder(DeiTEncoder):
         soft_rank_keep_mask = rank_mask_with_padding[token_rank]
         hard_keep_decision = soft_rank_keep_mask
         hard_keep_decision = hard_keep_decision.unsqueeze(-1)
-
         binary_pruner_mask = (pruner_mask > 0.0).float()
         hard_pruner_mask = (binary_pruner_mask - pruner_mask).detach() + pruner_mask
         hard_keep_decision = (1.0 - ((1.0 - hard_keep_decision) * hard_pruner_mask)) * binary_prev_decision
@@ -356,9 +357,9 @@ class PrunDeiTEncoder(DeiTEncoder):
             
         # skip the first [CLS] token  and distill token
         prev_decision = torch.where(
-            attention_mask[..., 2:].reshape((B, seq_len - 2, 1)) > -1,   
-            torch.ones((B, seq_len - 2, 1), dtype=hidden_states.dtype, device=hidden_states.device),
-            torch.zeros((B, seq_len - 2, 1), dtype=hidden_states.dtype, device=hidden_states.device),
+            attention_mask[..., 1:].reshape((B, seq_len - 1, 1)) > -1,   
+            torch.ones((B, seq_len - 1, 1), dtype=hidden_states.dtype, device=hidden_states.device),
+            torch.zeros((B, seq_len - 1, 1), dtype=hidden_states.dtype, device=hidden_states.device),
         )
         policy = torch.ones(
             B, seq_len, 1,
@@ -374,6 +375,7 @@ class PrunDeiTEncoder(DeiTEncoder):
         self.retain_mask = 1
         self.forward_mask = 0
         forward_hidden_states = hidden_states.clone()
+        self.hidden_states.append(hidden_states)
         # print(attention_mask.dtype)
         # exit()
         for i, layer_module in enumerate(self.layer):
@@ -391,14 +393,14 @@ class PrunDeiTEncoder(DeiTEncoder):
                             pred_score=pred_score,
                             rank_mask=token_z[p_count],
                             prev_decision=prev_decision,
-                            attention_mask=attention_mask[..., 2:].reshape(B, -1),
+                            attention_mask=attention_mask[..., 1:].reshape(B, -1),
                             pruner_mask=pruner_z[p_count],
                             # excluded_token_mask=excluded_token_mask,
                         )
-                        out_pred_prob.append(hard_keep_decision.reshape(B, seq_len - 2))
+                        out_pred_prob.append(hard_keep_decision.reshape(B, seq_len - 1))
                         cls_policy = torch.ones(B, 1, 1, dtype=hard_keep_decision.dtype, device=hard_keep_decision.device)
-                        distill_token_policy = cls_policy = torch.ones(B, 1, 1, dtype=hard_keep_decision.dtype, device=hard_keep_decision.device)
-                        policy = torch.cat([cls_policy, distill_token_policy,hard_keep_decision], dim=1)
+                        # distill_token_policy = cls_policy = torch.ones(B, 1, 1, dtype=hard_keep_decision.dtype, device=hard_keep_decision.device)
+                        policy = torch.cat([cls_policy,hard_keep_decision], dim=1)
                         self.masks[i] = hard_keep_decision.squeeze(-1).detach() > 0
                         hidden_states *= policy       
                         layer_outputs = layer_module(
@@ -418,12 +420,12 @@ class PrunDeiTEncoder(DeiTEncoder):
                         new_attention_mask = self.get_new_attention_mask_for_inference(
                             token_score=pred_score[:, :, 0],
                             rank_mask=token_z[p_count] if self.hard_token_mask is None else self.hard_token_mask[p_count],
-                            attention_mask=attention_mask[..., 2:].reshape(B, -1),
+                            attention_mask=attention_mask[..., 1:].reshape(B, -1),
                             pruner_mask=pruner_z[p_count] if self.hard_pruner_mask is None else self.hard_pruner_mask[p_count],
                             # excluded_token_mask=excluded_token_mask,
                         )
                         self.masks[i] = new_attention_mask.detach() > -1
-                        attention_mask[..., 2:] = new_attention_mask.reshape(B, 1, 1, -1)
+                        attention_mask[..., 1:] = new_attention_mask.reshape(B, 1, 1, -1).clone()
                         layer_outputs = layer_module(
                             hidden_states,
                             attention_mask,
@@ -449,11 +451,18 @@ class PrunDeiTEncoder(DeiTEncoder):
                         hidden_z=hidden_z,
                     )
                 # pred_score = layer_module.attention.self.token_score.unsqueeze(-1)
+                # prev score
                 attention_probs = layer_outputs[1]
                 sz = attention_probs.shape[-1]
                 batch_size = attention_probs.shape[0]
                 # skip the first [CLS] token and [distill] token
-                pred_score = attention_probs.view(batch_size, -1, sz).mean(dim=1)[..., 2:].unsqueeze(-1)
+                pred_score = attention_probs.view(batch_size, -1, sz).mean(dim=1)[..., 1:].unsqueeze(-1)
+                
+                # # compute context as import score
+                # context = layer_outputs[2]
+                # pred_score = torch.sum(torch.abs(context), dim=-1)[..., 1:].unsqueeze(-1)
+                
+                
                 self.pred_scores[i] = pred_score
                 if not self.training:
                     self.inference_statistics["pruned_effective_lengths"][i] = torch.sum((attention_mask.reshape(B, -1) > -1.0), dim=1).detach().cpu().numpy()
@@ -475,18 +484,19 @@ class PrunDeiTEncoder(DeiTEncoder):
                 batch_size = attention_probs.shape[0]
                 # skip the first [CLS] token
                 pred_score = attention_probs.view(batch_size, -1, sz).mean(dim=1)[..., 1:].unsqueeze(-1)
+                # print(pred_score.size())
                 self.last_pred_score = pred_score
                 self.pred_scores[i] = pred_score
             hidden_states = layer_outputs[0]
 
 
             if self.masks[i] is not None:
-                mask_with_cls_distill = torch.ones(self.masks[i].shape[0], self.masks[i].shape[1]+2, device=self.masks[i].device)
-                mask_with_cls_distill[:, 2:] = self.masks[i]
+                mask_with_cls_distill = torch.ones(self.masks[i].shape[0], self.masks[i].shape[1]+1, device=self.masks[i].device)
+                mask_with_cls_distill[:, 1:] = self.masks[i]
                 self.retain_mask = mask_with_cls_distill.view(*mask_with_cls_distill.shape, 1)
                 self.forward_mask = 1 - self.retain_mask
             forward_hidden_states = forward_hidden_states * self.forward_mask + hidden_states * self.retain_mask
-
+            self.hidden_states.append(hidden_states)
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
 
@@ -508,9 +518,9 @@ class PrunDeiTModel(DeiTModel):
     def __init__(self, config, token_prune_loc=None,use_mask_token: bool = False,add_pooling_layer: bool = True):
         super().__init__(config)
         self.encoder = PrunDeiTEncoder(config, token_prune_loc=token_prune_loc)
-        self.embeddings = DeiTEmbeddings(config, use_mask_token=use_mask_token)
+        self.embeddings = ViTEmbeddings(config, use_mask_token=use_mask_token)
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.pooler = DeiTPooler(config) if add_pooling_layer else None
+        self.pooler = ViTPooler(config) if add_pooling_layer else None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -613,14 +623,9 @@ class PrunDeiTModelForClassficationWithTeacher(DeiTPreTrainedModel):
     def __init__(self, config: DeiTConfig, token_prune_loc=None):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.deit = PrunDeiTModel(config, token_prune_loc=token_prune_loc,add_pooling_layer=False)
+        self.vit = PrunDeiTModel(config, token_prune_loc=token_prune_loc,add_pooling_layer=False)
         # Classifier heads
-        self.cls_classifier = (
-            nn.Linear(config.hidden_size, config.num_labels) if config.num_labels > 0 else nn.Identity()
-        )
-        self.distillation_classifier = (
-            nn.Linear(config.hidden_size, config.num_labels) if config.num_labels > 0 else nn.Identity()
-        )
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels) if config.num_labels > 0 else nn.Identity()
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -645,7 +650,7 @@ class PrunDeiTModelForClassficationWithTeacher(DeiTPreTrainedModel):
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
-        outputs,token_pruning_outputs = self.deit(
+        outputs,token_pruning_outputs = self.vit(
             pixel_values,
             head_mask=head_mask,
             token_z=token_z,
@@ -657,11 +662,9 @@ class PrunDeiTModelForClassficationWithTeacher(DeiTPreTrainedModel):
         )
 
         sequence_output = outputs[0]
-        cls_logits = self.cls_classifier(sequence_output[:, 0, :])
-        distillation_logits = self.distillation_classifier(sequence_output[:, 1, :])
 
-        # during inference, return the average of both classifier predictions
-        logits = (cls_logits + distillation_logits) / 2
+        logits = self.classifier(sequence_output[:, 0, :])
+        feature_logits = self.classifier(sequence_output[:, 1:, :])
 
         loss = None
         # if labels is not None:
@@ -670,17 +673,15 @@ class PrunDeiTModelForClassficationWithTeacher(DeiTPreTrainedModel):
         #     loss = base_criterion(logits,labels)
             
         if not return_dict:
-            output = (logits, cls_logits, distillation_logits) + outputs[1:] + loss
-            return output
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
 
-
-        return DeiTForImageClassificationWithTeacherOutputLoss(
+        return ImageClassifierOutput(
+            loss=loss if loss is not None else None,
             logits=logits,
-            cls_logits=cls_logits,
-            distillation_logits=distillation_logits,
+            feature_logits=feature_logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            loss=loss if loss is not None else None
         )
 
 
@@ -766,8 +767,15 @@ class PrunDeiTModelForClassfication(DeiTPreTrainedModel):
 class ImageClassifierOutput(ModelOutput):
     loss: torch.FloatTensor = None
     logits: torch.FloatTensor = None
+    feature_logits: torch.FloatTensor = None
     # cls_logits: torch.FloatTensor = None
     # distillation_logits: torch.FloatTensor = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
+
+def has_negative(tensor):
+    return torch.lt(tensor, torch.zeros_like(tensor)).any()
+
+# tensor = torch.tensor([1, 2, -3])
+# print(has_negative(tensor))  # True
     

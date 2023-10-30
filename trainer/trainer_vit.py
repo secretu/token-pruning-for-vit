@@ -3,7 +3,6 @@ import os
 import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -113,7 +112,7 @@ class CoFiTrainer(Trainer):
 
         self.l0_module = l0_module
         # FIXME: prepruning_finetune_steps
-        self.prepruning_finetune_steps = 2  
+        self.prepruning_finetune_steps = 1    #  1 epoch
         self.start_prune = False
 
         self.l0_optimizer = None
@@ -175,8 +174,7 @@ class CoFiTrainer(Trainer):
                     "params": [p for n, p in self.l0_module.named_parameters() if "lambda" in n],
                     "weight_decay": 0.0,
                     # "lr": -self.additional_args.reg_learning_rate     
-                    "lr": -self.additional_args.lambda_learning_rate  # just increase the lambda lr
-
+                    "lr": -self.additional_args.lambda_learning_rate  
                     
                 }]
                 log_params(lagrangian_params, "l0 reg lagrangian params")
@@ -334,7 +332,7 @@ class CoFiTrainer(Trainer):
                 cls_kl_loss_step = loss_terms['cls_kl_loss']
                 token_kl_loss_step = loss_terms['token_kl_loss']
 
-                tr_loss += tr_loss_step if tr_loss_step is not None else 0.0
+                tr_loss += tr_loss_step
                 lag_loss += lag_loss_step if lag_loss_step is not None else 0.0
                 score_loss += score_loss_step if score_loss_step is not None else 0.0
                 debug_loss += debug_loss_step if debug_loss_step is not None else 0.0
@@ -358,8 +356,6 @@ class CoFiTrainer(Trainer):
                         self.l0_optimizer.step()
                         self.lagrangian_optimizer.step()
                         
-                        
-                    
                     if self.lr_scheduler is not None:
                         self.lr_scheduler.step()
 
@@ -434,7 +430,7 @@ class CoFiTrainer(Trainer):
                         self.log(logs)
 
                     if self.state.global_step % self.args.eval_steps == 0:
-                        
+
                         self.evaluate()
 
                 if self.args.max_steps > 0 and self.state.global_step >= self.args.max_steps:
@@ -495,6 +491,7 @@ class CoFiTrainer(Trainer):
         # self.start_prune = True
         if self.start_prune:
             self.l0_module.eval()
+            print(self.l0_module.token_loga)
             zs = self.l0_module.forward(training=False)
 
         if zs is not None:
@@ -508,7 +505,7 @@ class CoFiTrainer(Trainer):
             if zs is not None:
                 if ii == 0:
                     logger.info(f"Putting zs {zs.keys()} into inputs:")
-                self.fill_inputs_with_zs(zs, inputs) #! use the zs            
+                self.fill_inputs_with_zs(zs, inputs) #! use the zs           
             loss, logits, labels = self.prediction_step(
                 model, inputs, prediction_loss_only)
 
@@ -832,37 +829,14 @@ class CoFiTrainer(Trainer):
         #         teacher_outputs = self.teacher_model(**teacher_inputs)
                 
         from timm.loss import  SoftTargetCrossEntropy  # loss same as dynamic vit 
-        from torch.nn import CrossEntropyLoss
-        base_criterion = CrossEntropyLoss()
+        # from torch.nn import CrossEntropyLoss
+        # base_criterion = CrossEntropyLoss()
+        
+        base_criterion = SoftTargetCrossEntropy()
         base_loss = None 
         cls_kl_loss = None  
         token_kl_loss = None
         if self.teacher_model is not None:
-            # loss = self.compute_loss(model, inputs)
-            # labels = inputs.pop("labels")    
-            # labels = labels.squeeze(1)
-            # model_output = model(**inputs)
-            # with torch.no_grad():
-            #     teacher_outputs = self.teacher_model(inputs['pixel_values'])
-            # cls_t, token_t = teacher_outputs['cls_logits'],teacher_outputs['distillation_logits']
-            # cls_s,token_s = model_output['cls_logits'],model_output['distillation_logits']
-            # base_loss = base_criterion(cls_s,labels)
-            
-            # cls_kl_loss = F.kl_div(
-            #     F.log_softmax(cls_s, dim=-1),
-            #     F.log_softmax(cls_t, dim=-1),
-            #     reduction='batchmean',
-            #     log_target=True
-            # )
-            # token_kl_loss = F.kl_div(
-            #             F.log_softmax(token_s, dim=-1),
-            #             F.log_softmax(token_t, dim=-1),
-            #             reduction='batchmean',
-            #             log_target=True
-            #         )
-            # loss = base_loss + cls_kl_loss +  token_kl_loss
-
-
             labels = inputs.pop("labels")    
             labels = labels.squeeze(1)
             model_output = model(**inputs)
@@ -878,41 +852,19 @@ class CoFiTrainer(Trainer):
                 reduction='batchmean',
                 log_target=True
             )
-            
-            # token kl loss
-
-            mask = model_output['prev_decision']
-            B, N, C = token_s.size()
-            assert mask.numel() == B * N
-
-            bool_mask = mask.reshape(B*N) > 0.5
-
-            token_s = token_s.reshape(B*N, C)
-            token_t = token_t.reshape(B*N, C)
-
-            if mask.sum() < 0.1:
-                token_kl_loss = token_s.new(1,).fill_(0.0)
-            else:
-                token_t = token_t[bool_mask]
-                token_s = token_s[bool_mask]
-                token_kl_loss = F.kl_div(
-                        F.log_softmax(token_s, dim=-1),
-                        F.log_softmax(token_t, dim=-1),
+             
+            token_kl_loss = F.kl_div(
+                        F.log_softmax(token_s + 1e-8, dim=-1),
+                        F.log_softmax(token_t + 1e-8, dim=-1),
                         reduction='batchmean',
                         log_target=True
                     )
-        
-            loss = base_loss + cls_kl_loss * 0.5   + token_kl_loss *0.5
             
+            
+            loss = base_loss + cls_kl_loss +  token_kl_loss
+            # loss = base_loss   
 
-           
         else :
-            # labels = inputs.pop("labels")
-            # outputs = model(**inputs)
-            # logits = outputs["logits"] if isinstance(outputs, dict) else outputs[0]  # out logits
-            # # logits = outputs["cls_logits"] if isinstance(outputs, dict) else outputs[1]  # only cls loss
-            # loss = base_criterion(logits,labels)
-            
             loss = self.compute_loss(model, inputs)
            
         # if self.teacher_model is None:
@@ -1016,9 +968,8 @@ class CoFiTrainer(Trainer):
         #         "lagrangian_loss": lagrangian_loss.detach() if lagrangian_loss is not None else None,
         #         "distill_layer_loss": distill_loss.detach() if distill_loss is not None else None,
         #         "distill_ce_loss": distill_ce_loss.detach() if distill_ce_loss is not None else None})
-        # loss = None
         return {
-            "loss": loss.detach() if loss is not None else None,
+            "loss": loss.detach(),
             'base_loss': base_loss.detach() if base_loss is not None else None,
             'cls_kl_loss': cls_kl_loss.detach() if cls_kl_loss is not None else None,
             'token_kl_loss': token_kl_loss.detach() if token_kl_loss is not None else None,

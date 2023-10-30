@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+
 import torch.nn.functional as F
 import torch.nn as nn
 from packaging import version
@@ -16,7 +17,7 @@ from tqdm import tqdm
 from transformers import Trainer
 from transformers.data.data_collator import DataCollator
 from transformers.modeling_utils import PreTrainedModel
-from transformers.optimization import get_linear_schedule_with_warmup
+from transformers.optimization import get_linear_schedule_with_warmup,get_cosine_schedule_with_warmup
 from torch.optim import AdamW
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer import Trainer
@@ -100,6 +101,9 @@ class CoFiTrainer(Trainer):
             compute_metrics: Optional[Callable[[EvalPrediction], Dict]] = None,
             l0_module=None,
             teacher_model=None,
+            mixup_fn=None,
+            cls_kl_ratio=0.5,
+            token_kl_ratio=0.5,
             **kwargs,
     ):
 
@@ -115,6 +119,11 @@ class CoFiTrainer(Trainer):
         # FIXME: prepruning_finetune_steps
         self.prepruning_finetune_steps = 2  
         self.start_prune = False
+        
+        self.cls_kl_ratio = cls_kl_ratio
+        self.token_kl_ratio = token_kl_ratio
+        
+        
 
         self.l0_optimizer = None
         self.lagrangian_optimizer = None
@@ -125,7 +134,7 @@ class CoFiTrainer(Trainer):
         self.teacher_model = teacher_model
         if self.teacher_model is not None:
             self.teacher_model = self.teacher_model.to(self.args.device)
-
+        self.mixup_fn = mixup_fn
         log_level = args.get_process_log_level()
         logging.set_verbosity(log_level)
         logger.setLevel(log_level)
@@ -186,14 +195,20 @@ class CoFiTrainer(Trainer):
                                                     eps=self.args.adam_epsilon)
 
         if self.lr_scheduler is None:
-            if self.additional_args.scheduler_type == "linear":
+            if self.additional_args.scheduler_type == "cosin":
+                self.lr_scheduler = get_cosine_schedule_with_warmup(self.optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=num_training_steps)
+                print("Use Cosine LR scheduler")
+            elif self.additional_args.scheduler_type == "linear":
                 self.lr_scheduler = get_linear_schedule_with_warmup(
                     self.optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=num_training_steps
                 )
+                print("Use linear LR scheduler")
             else:
+                print('use None LR scheduler')
                 self.lr_scheduler = None
 
     def train(self):
+        self.args.dataloader_drop_last = True
         train_dataloader = self.get_train_dataloader()
         num_update_steps_per_epoch = len(
             train_dataloader) // self.args.gradient_accumulation_steps
@@ -253,6 +268,7 @@ class CoFiTrainer(Trainer):
         base_loss = torch.tensor(0.0).to(self.args.device)
         cls_kl_loss = torch.tensor(0.0).to(self.args.device)
         token_kl_loss = torch.tensor(0.0).to(self.args.device)
+        rank_loss = torch.tensor(0.0).to(self.args.device)
 
 
         logging_loss_scalar = 0.0
@@ -263,6 +279,7 @@ class CoFiTrainer(Trainer):
         logging_base_loss_scalar = 0.0
         logging_cls_kl_loss_scalar = 0.0
         logging_token_kl_loss_scalar = 0.0
+        logging_rank_loss_scalar = 0.0
 
         model.zero_grad()
         if self.l0_module is not None:
@@ -277,12 +294,12 @@ class CoFiTrainer(Trainer):
         # disable_tqdm = self.args.disable_tqdm or not self.is_local_process_zero()
         total_epoch_num = int(np.ceil(num_train_epochs)) - epochs_trained
         total_steps = total_epoch_num * len(train_dataloader)
-        # self.evaluate()
+        self.evaluate()
         
         pbar = tqdm(
             total=total_steps,
             desc="Training Process",
-            disable="device-aware-bert" in self.args.output_dir,
+            disable=True,
         )
 
         training_start_time = time.time()
@@ -314,18 +331,22 @@ class CoFiTrainer(Trainer):
                     # reset the optimizer
                     self.create_optimizer_and_scheduler(lr_steps, self.start_prune)
                     logger.info(f"Starting l0 regularization! using {type(self.l0_module)}")
-                    print(f"Starting l0 regularization! using {type(self.l0_module)}, temperature: {self.l0_module.temperature:.2f}, init drop rate: {self.l0_module.droprate_init} token_loga shape: {list(self.l0_module.token_loga.shape)} prune location: {self.l0_module.token_prune_loc}")
+                    # print(f"Starting l0 regularization! using {type(self.l0_module)}, temperature: {self.l0_module.temperature:.2f}, init drop rate: {self.l0_module.droprate_init} token_loga shape: {list(self.l0_module.token_loga.shape)} prune location: {self.l0_module.token_prune_loc}")
                     print("NDCG TOPK=", self.additional_args.topk)
                 # self.start_prune= True
+                
+                
+                
                 if self.start_prune:
                     zs = self.l0_module.forward(training=True) #! get the zs
                     self.fill_inputs_with_zs(zs, inputs) #! use the zs
+                    
                
                
                 loss_terms = self.training_step(model, inputs)
                 target_sparsity_log = loss_terms['target_sparsity_log']
                 expected_sparsity_log = loss_terms['expected_sparsity_log']
-                
+                rank_loss_step = loss_terms["rank_loss"]
                 tr_loss_step = loss_terms["loss"]
                 lag_loss_step = loss_terms["lagrangian_loss"]
                 score_loss_step = loss_terms["attention_score_distillation_loss"]
@@ -334,7 +355,8 @@ class CoFiTrainer(Trainer):
                 cls_kl_loss_step = loss_terms['cls_kl_loss']
                 token_kl_loss_step = loss_terms['token_kl_loss']
 
-                tr_loss += tr_loss_step if tr_loss_step is not None else 0.0
+                rank_loss += rank_loss_step
+                tr_loss += tr_loss_step
                 lag_loss += lag_loss_step if lag_loss_step is not None else 0.0
                 score_loss += score_loss_step if score_loss_step is not None else 0.0
                 debug_loss += debug_loss_step if debug_loss_step is not None else 0.0
@@ -390,15 +412,17 @@ class CoFiTrainer(Trainer):
                         base_loss_scalar = base_loss.item()
                         cls_kl_loss_scalar = cls_kl_loss.item()
                         token_kl_loss_scalar = token_kl_loss.item()
-
+                        rank_loss_scalar = rank_loss.item()
                         # logs['expected_sparsity_log'] = expected_sparsity_log
-                        logs['target_sparsity_log'] = target_sparsity_log
+                        # logs['target_sparsity_log'] = target_sparsity_log
                         
                         
                         logs["loss"] = (
                             tr_loss_scalar - logging_loss_scalar) / self.args.logging_steps
                         logs["base_loss"] = (
                             base_loss_scalar - logging_base_loss_scalar) / self.args.logging_steps
+                        logs["rank_loss"] = (
+                            rank_loss_scalar - logging_rank_loss_scalar) / self.args.logging_steps
                         logs["cls_kl_loss"] = (
                             cls_kl_loss_scalar - logging_cls_kl_loss_scalar) / self.args.logging_steps
                         logs["token_kl_loss"] = (
@@ -429,13 +453,14 @@ class CoFiTrainer(Trainer):
                         logging_base_loss_scalar = base_loss_scalar
                         logging_cls_kl_loss_scalar = cls_kl_loss_scalar
                         logging_token_kl_loss_scalar = token_kl_loss_scalar
+                        logging_rank_loss_scalar = rank_loss_scalar
 
-
+        
                         self.log(logs)
 
                     if self.state.global_step % self.args.eval_steps == 0:
-                        
                         self.evaluate()
+                        
 
                 if self.args.max_steps > 0 and self.state.global_step >= self.args.max_steps:
                     break
@@ -499,8 +524,10 @@ class CoFiTrainer(Trainer):
 
         if zs is not None:
             pruned_model_size_info = self.l0_module.calculate_model_size(zs, self.model.config.finetuning_task)
+            
 
-        disable_tqdm = "device-aware-bert" in self.args.output_dir
+        disable_tqdm = True
+        # disable_tqdm = False
         expected_sparsities = []
         expected_sequence_sparsities = []
         target_sparsities = []
@@ -618,7 +645,9 @@ class CoFiTrainer(Trainer):
         print_keys = [
             name, "eval_loss",'top1ACC','top5ACC',
             'macs_sparsity', "expected_sparsity", "expected_sequence_sparsity",
-            'target_sparsity', 'step', "token_prune_loc"
+            'target_sparsity', 'step', "token_prune_loc",
+            'token_ratio','model_ratio','total_ratio'
+
         ]
         print("-" * 70)
         print("time:", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
@@ -731,7 +760,7 @@ class CoFiTrainer(Trainer):
 
 
     def calculate_attention_score_distillation_loss(
-        self, target_attention_score, attention_scores, attention_mask, token_masks, TOPK=20,
+        self, target_attention_score, attention_scores, attention_mask, token_masks=None, TOPK=20,
     ):
         # score_distillation_loss_fn = None
         # score_distillation_loss_fn = PairwiseHingeLoss()
@@ -739,13 +768,15 @@ class CoFiTrainer(Trainer):
         # score_distillation_loss_fn = PairwiseLogisticLoss()
         score_distillation_loss_fn = LambdaARPLoss2()
 
-        max_length = attention_mask.sum(-1).max().item()
+        max_length = int(attention_mask.sum(-1).max().item())
+        target_attention_score = target_attention_score[0]
         target_attention_score = target_attention_score[..., 0][:, :max_length].detach()
         attention_mask = attention_mask[:, :max_length]
         n = attention_mask.sum(-1).detach().long()
 
         loss = 0
         for i in range(1, len(attention_scores) // 3):
+        # for i in range(2, 5):
             if isinstance(score_distillation_loss_fn, LambdaARPLoss2):
                 # if token_masks[i] is not None:
                 #     target = target_attention_score * token_masks[i]
@@ -832,38 +863,21 @@ class CoFiTrainer(Trainer):
         #         teacher_outputs = self.teacher_model(**teacher_inputs)
                 
         from timm.loss import  SoftTargetCrossEntropy  # loss same as dynamic vit 
-        from torch.nn import CrossEntropyLoss
-        base_criterion = CrossEntropyLoss()
+        # from torch.nn import CrossEntropyLoss
+        # base_criterion = CrossEntropyLoss()
+        
+        base_criterion = SoftTargetCrossEntropy()
         base_loss = None 
         cls_kl_loss = None  
         token_kl_loss = None
+        
+        
         if self.teacher_model is not None:
-            # loss = self.compute_loss(model, inputs)
-            # labels = inputs.pop("labels")    
-            # labels = labels.squeeze(1)
-            # model_output = model(**inputs)
-            # with torch.no_grad():
-            #     teacher_outputs = self.teacher_model(inputs['pixel_values'])
-            # cls_t, token_t = teacher_outputs['cls_logits'],teacher_outputs['distillation_logits']
-            # cls_s,token_s = model_output['cls_logits'],model_output['distillation_logits']
-            # base_loss = base_criterion(cls_s,labels)
-            
-            # cls_kl_loss = F.kl_div(
-            #     F.log_softmax(cls_s, dim=-1),
-            #     F.log_softmax(cls_t, dim=-1),
-            #     reduction='batchmean',
-            #     log_target=True
-            # )
-            # token_kl_loss = F.kl_div(
-            #             F.log_softmax(token_s, dim=-1),
-            #             F.log_softmax(token_t, dim=-1),
-            #             reduction='batchmean',
-            #             log_target=True
-            #         )
-            # loss = base_loss + cls_kl_loss +  token_kl_loss
-
-
-            labels = inputs.pop("labels")    
+            labels = inputs.pop("labels")
+            pixel_values = inputs.pop('pixel_values')
+            pixel_values,labels  = self.mixup_fn(pixel_values,labels)
+            inputs['pixel_values'] = pixel_values
+               
             labels = labels.squeeze(1)
             model_output = model(**inputs)
             with torch.no_grad():
@@ -878,8 +892,6 @@ class CoFiTrainer(Trainer):
                 reduction='batchmean',
                 log_target=True
             )
-            
-            # token kl loss
 
             mask = model_output['prev_decision']
             B, N, C = token_s.size()
@@ -896,13 +908,13 @@ class CoFiTrainer(Trainer):
                 token_t = token_t[bool_mask]
                 token_s = token_s[bool_mask]
                 token_kl_loss = F.kl_div(
-                        F.log_softmax(token_s, dim=-1),
-                        F.log_softmax(token_t, dim=-1),
+                        F.log_softmax(token_s + 1e-8, dim=-1),
+                        F.log_softmax(token_t + 1e-8, dim=-1),
                         reduction='batchmean',
                         log_target=True
                     )
-        
-            loss = base_loss + cls_kl_loss * 0.5   + token_kl_loss *0.5
+            # loss = base_loss + cls_kl_loss * 0.5   + token_kl_loss * 0.5
+            loss = base_loss + cls_kl_loss * self.cls_kl_ratio   + token_kl_loss * self.token_kl_ratio
             
 
            
@@ -947,6 +959,7 @@ class CoFiTrainer(Trainer):
         attention_score_distillation_loss = None
         expected_sparsity_log = None
         target_sparsity_log = None
+        rank_loss = None
         # self.start_prune = True 
         if self.start_prune:
             lagrangian_loss, expected_sparsity_log, target_sparsity_log, expected_sequence_sparsity_log = \
@@ -980,32 +993,35 @@ class CoFiTrainer(Trainer):
             #################### rank distillation loss ####################
 
             # disable score distill
-            # target_attention_score = self.teacher_model.bert.encoder.last_pred_score
-            # # target_attention_score = self.teacher_model.bert.encoder.pred_scores[11]
-            # attention_score_distillation_loss = self.calculate_attention_score_distillation_loss(
-            #     target_attention_score=target_attention_score,
-            #     attention_scores=model.bert.encoder.pred_scores,
-            #     attention_mask=inputs["attention_mask"][..., 1:],
-            #     token_masks=model.bert.encoder.masks,
-            #     TOPK=self.additional_args.topk,
-            # )
-        
-            # warmup_progress = self.l0_module.get_warmup_progress(
-            #     self.state.global_step - self.prepruning_finetune_steps,
-            # )
-            # rank_loss_lambda = self.additional_args.distill_ce_loss_alpha * max(0.01, 1.0 - warmup_progress)
-            # # rank_loss_lambda = self.additional_args.distill_ce_loss_alpha
-            # debug_attention_score_distillation_loss = attention_score_distillation_loss.item() * rank_loss_lambda
-            # loss += attention_score_distillation_loss * rank_loss_lambda
-            # if self.state.global_step % (self.args.eval_steps // 2) == 0:
-            #     print(f"loss: {debug_loss:.6f}, lagrangian_loss: {debug_lagrangian_loss:.6f}, attention_score_distillation_loss: {debug_attention_score_distillation_loss:.6f}")
-            # if self.state.global_step % (self.args.eval_steps // 2) == 0:
-            #     print(f"loss: {debug_loss:.6f}, lagrangian_loss: {debug_lagrangian_loss:.6f}")
-        
-            if self.additional_args.enable_rank_mask_reg:
-                mask_loss = self.l0_module.mask_regularization(self.state.global_step - self.prepruning_finetune_steps)
-                loss += mask_loss
-            ################################################################
+        target_attention_score = self.teacher_model.vit.encoder.pred_scores[-1],
+        # target_attention_score = self.teacher_model.bert.encoder.pred_scores[11]
+        attention_score_distillation_loss = self.calculate_attention_score_distillation_loss(
+            target_attention_score=target_attention_score,
+            attention_scores=model.vit.encoder.pred_scores,
+            attention_mask=inputs["attention_mask"][..., 1:],
+            # token_masks=model.bert.encoder.masks,
+            TOPK=self.additional_args.topk,
+        )
+    
+        warmup_progress = self.l0_module.get_warmup_progress(
+            self.state.global_step - self.prepruning_finetune_steps,
+        )
+        rank_loss_lambda = self.additional_args.distill_ce_loss_alpha * max(0.01, 1.0 - warmup_progress)
+        # # rank_loss_lambda = self.additional_args.distill_ce_loss_alpha
+        # debug_attention_score_distillation_loss = attention_score_distillation_loss.item() * rank_loss_lambda
+        rank_loss = attention_score_distillation_loss * rank_loss_lambda
+        # loss += rank_loss
+
+
+        # if self.state.global_step % (self.args.eval_steps // 2) == 0:
+        #     print(f"loss: {debug_loss:.6f}, lagrangian_loss: {debug_lagrangian_loss:.6f}, attention_score_distillation_loss: {debug_attention_score_distillation_loss:.6f}")
+        # if self.state.global_step % (self.args.eval_steps // 2) == 0:
+        #     print(f"loss: {debug_loss:.6f}, lagrangian_loss: {debug_lagrangian_loss:.6f}")
+    
+        if self.additional_args.enable_rank_mask_reg:
+            mask_loss = self.l0_module.mask_regularization(self.state.global_step - self.prepruning_finetune_steps)
+            loss += mask_loss
+        ################################################################
 
         if self.args.gradient_accumulation_steps > 1:
             loss = loss / self.args.gradient_accumulation_steps
@@ -1016,12 +1032,12 @@ class CoFiTrainer(Trainer):
         #         "lagrangian_loss": lagrangian_loss.detach() if lagrangian_loss is not None else None,
         #         "distill_layer_loss": distill_loss.detach() if distill_loss is not None else None,
         #         "distill_ce_loss": distill_ce_loss.detach() if distill_ce_loss is not None else None})
-        # loss = None
         return {
-            "loss": loss.detach() if loss is not None else None,
+            "loss": 0,#loss.detach(),
             'base_loss': base_loss.detach() if base_loss is not None else None,
+            'rank_loss': rank_loss.detach() if rank_loss is not None else None,
             'cls_kl_loss': cls_kl_loss.detach() if cls_kl_loss is not None else None,
-            'token_kl_loss': token_kl_loss.detach() if token_kl_loss is not None else None,
+            'token_kl_loss': 0,#token_kl_loss.detach() if token_kl_loss is not None else None,
             'debug_loss':debug_loss if debug_loss is not None else None,
             "lagrangian_loss": lagrangian_loss.detach() if lagrangian_loss is not None else None,
             "distill_layer_loss": distill_loss.detach() if distill_loss is not None else None,
